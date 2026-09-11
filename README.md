@@ -1,6 +1,31 @@
-# SpotifyESP32
+# SpotifyESP32 — ESP32 fork by maurigno
 
 This library is a wrapper for the [Spotify Web API](https://developer.spotify.com/documentation/web-api/) designed to work with the [ESP32](https://www.espressif.com/en/products/socs/esp32/overview) microcontroller.
+
+This version was developed by **maurigno**, with authentication and TLS changes for ESP32 devices. It has been tested by maurigno with a **LILYGO T-Display ESP32** and **ESP32-S3 devices**. The original library was created by Finian Landes and its upstream contributors.
+
+## Differences from upstream
+
+This fork builds on [FinianLandes/SpotifyEsp32](https://github.com/FinianLandes/SpotifyEsp32), compared against upstream commit [`f5e4515`](https://github.com/FinianLandes/SpotifyEsp32/commit/f5e451527caec45b88a9173521739c2a1b6e1ee0). The changes in `src/SpotifyEsp32.cpp` and `src/SpotifyEsp32.h` focus on authentication reliability after reboot and on keeping Spotify connections certificate-verified. The rationale below is based on the implementation and its comments.
+
+| Change | Why it was made |
+| --- | --- |
+| Synchronize the clock in `begin()` when it is earlier than January 1, 2025. NTP uses `pool.ntp.org`, `time.nist.gov`, and `time.google.com`, with a wait of up to 15 seconds. | After a reset, an unset clock can make valid TLS certificates appear not yet valid, preventing token refresh even when a refresh token was saved. An already initialized clock skips this step. |
+| Replace the single embedded CA certificate with a public CA bundle stored in flash, described in the source as generated from certifi/Mozilla roots in ESP-IDF v5.5.4 bundle format. | Allow Spotify certificate chains to validate against a broader trust store instead of depending on the one certificate included upstream. Most of the added source lines are this bundle's byte data. |
+| Attach the CA bundle before each Spotify API or token connection. | Restore verification configuration across connection teardown. The code comments identify Arduino-ESP32 3.3.8 clearing the bundle callback on `stop()` as the reason. |
+| Use a separate `_auth_client` for the Vercel OAuth helper and close it before exchanging the authorization code. | The helper uses `setInsecure()`; separating the clients prevents that setting from affecting Spotify Accounts/API connections. Access-token retrieval now also depends on the authorization-code exchange succeeding. |
+| Initialize `_custom_scopes` to `nullptr`. | Avoid reading an uninitialized pointer when `begin()` checks whether custom scopes were supplied, which could otherwise cause invalid memory access. |
+| Check the Base64 encoder result and terminate the credential buffer using its returned `out_len`. | Handle encoding failures and avoid relying on `strlen()` to locate the end of the output buffer before explicitly terminating it. |
+| Parse HTTP headers line by line until the blank line, removing the extra delimiter search after `Content-Length`. | Avoid searching past the header boundary and potentially consuming response-body data or waiting unnecessarily, which can interfere with JSON token/API responses. |
+| Add clock, CA-bundle, and token-connection TLS diagnostics; stop printing the authorization code in its receipt log. | Make connection failures easier to diagnose while reducing authorization-code exposure in debug output. |
+
+### Using the authentication changes
+
+Connect Wi-Fi before calling `sp.begin()`. If clock synchronization times out, initialization continues and logs an error; certificate-verified connections may still fail until the clock is set. Applications can set the clock themselves before `begin()`.
+
+Refresh-token persistence is still the application's responsibility: save the token after initial authorization and supply it after reboot, for example with `Spotify sp(CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN);`. These changes improve the connection setup used to refresh tokens; they do not add automatic flash storage.
+
+The OAuth helper connection still disables certificate verification and carries a sensitive one-time authorization code. Only the Spotify Accounts/API client uses the CA bundle. The bundle adds firmware flash usage, and the fork requires support for `setCACertBundle(bundle, size)` and the embedded bundle format; compatibility with every core version supported by upstream has not been established. See the tested hardware below for the devices tested by maurigno.
 
 ⚠️ **Version 4 Notice:** This release may not be backward compatible with v3.x.x
 Some of the API endpoints were removed or renamed, to fully align with the new API provided by Spotify ([Spotify API update Blog](https://developer.spotify.com/blog/2026-02-06-update-on-developer-access-and-platform-security)).
@@ -79,12 +104,263 @@ Spotify sp(CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN);
 
 This way, you won’t have to reauthenticate each time.
 
-### 4. Setting Tokens at Runtime
+### 4. ESP32-S3 example: save the refresh token in NVM (NVS)
 
-If you prefer setting tokens during runtime (for example, using a web server), you can:
-Pass an empty string for the refresh token during initialization.
-Later, call get_user_tokens() to retrieve the tokens.
-Store them in flash memory (e.g., using [SPIFFS](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/storage/spiffs.html))
+This example is based on **maurigno's working ESP32-S3 application** and works with ESP32-S3 devices. It uses the ESP32 [Preferences library](https://docs.espressif.com/projects/arduino-esp32/en/latest/api/preferences.html) to store the refresh token in NVS, the ESP32's flash-backed nonvolatile storage. No external memory is needed.
+
+Replace the credential placeholders and configure the Spotify redirect URI as described above. On the first boot, open the authorization URL from the Serial Monitor at **115200 baud**. The sketch saves the refresh token; later boots load it automatically. Set `FORCE_NEW_LOGIN` to `true` to clear it and authorize again, then restore `false` and upload again.
+
+The sketch waits for Wi-Fi, NTP, and initial browser authorization. Playback information is printed when it changes. A failed saved-token request preserves the token so that a temporary connection problem does not erase the login. This adaptation adds storage checks and frees the token copies returned by the library; the adapted sketch has not been independently hardware-tested here.
+
+The complete sketch is also available as [nvsEsp32S3.ino](examples/nvsEsp32S3/nvsEsp32S3.ino).
+
+```cpp
+// ESP32-S3 example by maurigno: retain Spotify login in NVS across reboots.
+// Adapted from maurigno's working ESP32-S3 application.
+#include <Arduino.h>
+#include <WiFi.h>
+#include <SpotifyEsp32.h>
+#include <Preferences.h>
+#include <time.h>
+#include <stdlib.h> // free() releases the copies returned by get_user_tokens().
+
+const char* SSID = "your_ssid";
+const char* PASSWORD = "your_password";
+const char* CLIENT_ID = "your_client_id";
+const char* CLIENT_SECRET = "your_client_secret";
+
+// Set TRUE once if you want to ignore/delete the saved token
+// Then set it back to false and upload again to retain login on later boots.
+// and perform a fresh Spotify browser login.
+const bool FORCE_NEW_LOGIN = false;
+
+Preferences prefs;
+
+String refreshToken;
+Spotify* sp = nullptr;
+
+void connect_to_wifi();
+void syncTime();
+void saveRefreshToken();
+
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+
+    connect_to_wifi();
+    syncTime(); // TLS certificate validation needs a valid clock.
+
+    // Open the flash-backed NVS namespace for reading and writing.
+    // Values survive resets and power loss until removed or flash is erased.
+    if (!prefs.begin("spotify", false)) {
+        Serial.println("Cannot open NVS; stopping setup.");
+        return;
+    }
+
+    // --------------------------------------------------
+    // FORCE A NEW LOGIN
+    // --------------------------------------------------
+
+    if (FORCE_NEW_LOGIN) {
+        Serial.println();
+        Serial.println("FORCE_NEW_LOGIN enabled.");
+        Serial.println("Deleting saved Spotify refresh token...");
+
+        prefs.remove("refresh_token");
+        refreshToken = "";
+    } else {
+        refreshToken = prefs.getString("refresh_token", "");
+    }
+
+    // --------------------------------------------------
+    // CREATE SPOTIFY INSTANCE
+    // --------------------------------------------------
+
+    if (refreshToken.length() > 0) {
+        Serial.println("Refresh token found.");
+        Serial.println("Using saved Spotify login.");
+
+        sp = new Spotify(
+            CLIENT_ID,
+            CLIENT_SECRET,
+            refreshToken.c_str()
+        );
+    } else {
+        Serial.println("Starting WITHOUT saved authentication.");
+        Serial.println("Open the Spotify authorization URL.");
+
+        sp = new Spotify(
+            CLIENT_ID,
+            CLIENT_SECRET
+        );
+    }
+
+    // Empty scopes select the library defaults. Optional in this fork,
+    // which initializes the custom-scopes pointer.
+    sp->set_scopes("");
+
+    // Enable if needed
+    //sp->set_log_level(SPOTIFY_LOG_DEBUG);
+
+    // --------------------------------------------------
+    // START SPOTIFY
+    // --------------------------------------------------
+
+    sp->begin();
+
+    // --------------------------------------------------
+    // NO TOKEN -> WAIT FOR BROWSER AUTHENTICATION
+    // --------------------------------------------------
+
+    if (refreshToken.length() == 0) {
+
+        Serial.println("Waiting for Spotify authentication...");
+
+        while (!sp->is_auth()) {
+            sp->handle_client();
+            delay(10);
+        }
+
+        Serial.println("Browser authentication completed.");
+
+        // Save the newly issued refresh token
+        saveRefreshToken();
+
+        // saveRefreshToken() reports whether the flash write succeeded.
+    }
+
+    // --------------------------------------------------
+    // TOKEN EXISTS -> TRY IT
+    // --------------------------------------------------
+
+    else {
+        if (!sp->get_access_token()) {
+
+            Serial.println();
+            // A network/TLS failure does not prove the token was revoked.
+            // Keep it in NVS and retry after checking Wi-Fi and the clock.
+            Serial.println("Token request failed; keeping the saved token.");
+            Serial.println("Check connectivity, then restart to retry.");
+            Serial.println("For a revoked token, use FORCE_NEW_LOGIN.");
+            delete sp;
+            sp = nullptr;
+            prefs.end();
+            return;
+        }
+
+        Serial.println("Spotify authenticated.");
+    }
+
+    prefs.end(); // Close the handle; the stored token remains in flash.
+}
+
+void loop() {
+    static String lastArtist;
+    static String lastTrackname;
+
+    if (sp == nullptr) {
+        delay(1000);
+        return;
+    }
+
+    String currentArtist = sp->current_artist_names();
+    String currentTrackname = sp->current_track_name();
+
+    if (
+        currentArtist != lastArtist &&
+        currentArtist != "Something went wrong" &&
+        !currentArtist.isEmpty()
+    ) {
+        lastArtist = currentArtist;
+
+        Serial.println(
+            "Artist: " + currentArtist
+        );
+    }
+
+    if (
+        currentTrackname != lastTrackname &&
+        currentTrackname != "Something went wrong" &&
+        currentTrackname != "null" &&
+        !currentTrackname.isEmpty()
+    ) {
+        lastTrackname = currentTrackname;
+
+        Serial.println(
+            "Track: " + currentTrackname
+        );
+    }
+
+    delay(500); // Poll playback; print only when artist or track changes.
+}
+
+void saveRefreshToken() {
+    user_tokens tokens = sp->get_user_tokens();
+
+    if (
+        tokens.refresh_token != nullptr &&
+        strlen(tokens.refresh_token) > 0
+    ) {
+        String newToken = tokens.refresh_token;
+
+        // Write only when the token changes to avoid unnecessary flash writes.
+        if (newToken != refreshToken) {
+            if (prefs.putString("refresh_token", newToken) == newToken.length()) {
+                refreshToken = newToken;
+                Serial.println("Refresh token written to NVS.");
+            } else {
+                Serial.println("ERROR: Could not save the refresh token.");
+            }
+        }
+    } else {
+        Serial.println("ERROR: Spotify did not return a refresh token.");
+    }
+
+    // This library returns three strdup() allocations; release all three.
+    free(tokens.client_id);
+    free(tokens.client_secret);
+    free(tokens.refresh_token);
+}
+
+void connect_to_wifi() {
+    WiFi.begin(
+        SSID,
+        PASSWORD
+    );
+
+    Serial.print("Connecting to WiFi");
+
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(1000);
+        Serial.print(".");
+    }
+
+    Serial.println();
+    Serial.println("Connected to WiFi");
+}
+
+void syncTime() {
+    Serial.print("Synchronizing time");
+
+    configTime(
+        0,
+        0,
+        "pool.ntp.org",
+        "time.nist.gov"
+    );
+
+    time_t now = time(nullptr);
+
+    // Wait for UTC before starting Spotify; this waits until NTP succeeds.
+    while (now < 1735689600) {
+        delay(500);
+        Serial.print(".");
+        now = time(nullptr);
+    }
+
+    Serial.println();
+    Serial.println("Time synchronized");
+}```
 
 ### 5. Using the Library
 
@@ -228,9 +504,13 @@ Notes:
 - Enable debug mode using the above mentioned function `set_log_level`.
 - If requests fail, inspect the returned response or Serial output.
 - Test individual endpoints in the [Spotify Web API Console](https://developer.spotify.com/console/). </br>
-- Still having issues? Open an issue in this repository. Or contact me via email.
+- Still having issues? Open an issue in [this fork](https://github.com/mauringo/SpotifyEsp32_fixedAuthReboot/issues).
 
-## Supported Devices
+## Supported and Tested Devices
 
-- ESP32 WROOM
-- Should also work on other ESP32 models.
+This version is intended for the ESP32 family. Tested by maurigno with:
+
+- LILYGO T-Display ESP32
+- ESP32-S3 devices
+
+Other ESP32 boards may work, but are not listed as tested for this fork.

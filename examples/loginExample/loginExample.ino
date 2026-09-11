@@ -10,7 +10,8 @@
     edited by: Finian Landes
         * Updated login to work with version 2.x.x
 
-    Documentation: https://github.com/FinianLandes/Spotify_Esp32
+    ESP32 library fork by: maurigno
+    Documentation: https://github.com/mauringo/SpotifyEsp32_fixedAuthReboot
 */
 // Include the required libraries
 #include <Arduino.h>

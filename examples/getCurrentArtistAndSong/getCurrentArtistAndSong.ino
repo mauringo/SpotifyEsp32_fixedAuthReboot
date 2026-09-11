@@ -14,7 +14,8 @@ In this example your current track will be printed to the serial and as soon as 
     edited by: Finian Landes
         * Updated login to work with version 3.x.x
 
-    Documentation: https://github.com/FinianLandes/Spotify_Esp32
+    ESP32 library fork by: maurigno
+    Documentation: https://github.com/mauringo/SpotifyEsp32_fixedAuthReboot
 */
 // Include the required libraries
 #include <Arduino.h>
